@@ -94,6 +94,10 @@ __all__ = [
     "DatabaseContainsIncorrectValue",
     "DatabaseError",
     "DatabaseSessionIsOver",
+    "DeleteExplainEdge",
+    "DeleteExplainError",
+    "DeleteExplainGraph",
+    "DeleteExplainNode",
     "Discriminator",
     "ERDiagramError",
     "Error",
@@ -372,6 +376,10 @@ class OptimisticCheckError(IsolationError):
 
 
 class UnresolvableCyclicDependency(TransactionError):
+    pass
+
+
+class DeleteExplainError(OrmError):
     pass
 
 
@@ -6902,6 +6910,649 @@ class EntityProxy:
         return not self.__eq__(other)
 
 
+# ----------------------------------------------------------------------------
+# Read-only delete impact analysis, used by Entity.explain_delete()
+#
+# The traversal below mirrors Entity._delete_() step by step and reuses the
+# very same relationship metadata (attr.cascade_delete / attr.reverse /
+# reverse.is_required), so a preview can never invent a cascade rule that the
+# real delete() does not implement.
+#
+# Important distinction: the ORM-level actions described here are *observable
+# ORM hook behavior* (recursive _delete_() calls, relationship unlinking,
+# m2m link-table cleanup and the ConstraintError raised for a required
+# blocker). The database foreign key ON DELETE clause is a separate mechanism
+# executed by the database itself; it does not invoke ORM hooks such as
+# after_delete() and does not update the identity map. Both pieces of
+# information are kept on separate fields (orm_action vs db_on_delete) and
+# must never be merged into one observable behavior.
+# ----------------------------------------------------------------------------
+
+EXPLAIN_STATUS_COMPLETE = "complete"
+EXPLAIN_STATUS_INCOMPLETE = "incomplete"
+
+EDGE_CASCADE_DELETE = "cascade_delete"
+EDGE_NULLABLE_UNLINK = "nullable_unlink"
+EDGE_M2M_CLEANUP = "m2m_cleanup"
+EDGE_REQUIRED_BLOCKER = "required_blocker"
+EDGE_REVERSE_COLLECTION_REMOVE = "reverse_collection_remove"
+EDGE_UNKNOWN = "unknown"
+
+NODE_ACTION_DELETE = "delete"
+NODE_ACTION_DETACHED = "detached"
+NODE_ACTION_BLOCKED = "blocked"
+
+_ACTION_PRECEDENCE = {
+    NODE_ACTION_DETACHED: 0,
+    NODE_ACTION_BLOCKED: 1,
+    NODE_ACTION_DELETE: 2,
+}
+
+
+def _explain_obj_identity(obj):
+    """Full entity identity: concrete entity class plus complete primary key.
+
+    Cycles and descendants shared by several roots are deduplicated by this
+    key, so composite primary keys (including relation-backed primary keys)
+    are represented in their raw, fully expanded form.
+    """
+    entity = obj.__class__
+    if obj._pkval_ is None:
+        return entity, ("__new__", obj._newid_)
+    return entity, obj._get_raw_pkval_()
+
+
+def _explain_identity_label(entity, pk):
+    # Sensitive-data contract: only entity type and authorized primary key
+    # are ever rendered; full object repr() with ordinary attribute values is
+    # deliberately not used anywhere in delete-explain output or errors.
+    if isinstance(pk, tuple) and len(pk) == 2 and pk[0] == "__new__":
+        return "%s[new:%s]" % (entity.__name__, pk[1])
+    if isinstance(pk, tuple):
+        if len(pk) == 1:
+            return "%s[%r]" % (entity.__name__, pk[0])
+        return "%s[%s]" % (entity.__name__, ",".join(map(repr, pk)))
+    return "%s[%r]" % (entity.__name__, pk)
+
+
+def _explain_db_on_delete(attr, reverse):
+    """Database-side ON DELETE action mapped for this relationship.
+
+    Mirrors the mapping generation rules in Database.generate_mapping();
+    returns "CASCADE", "SET NULL" or None. This describes the database
+    foreign key clause only, never the ORM cascade behavior.
+    """
+    if reverse.is_collection:
+        # Many-to-many link table foreign keys are always ON DELETE CASCADE
+        return "CASCADE"
+    fk_attr = reverse if attr.is_collection else attr
+    parent_side = fk_attr.reverse
+    if parent_side.cascade_delete:
+        return "CASCADE"
+    if isinstance(fk_attr, Optional) and fk_attr.nullable:
+        return "SET NULL"
+    return None
+
+
+def _explain_snapshot_session(cache):
+    """Observation version of the current session state."""
+    return (
+        cache.num,
+        cache.modified,
+        len(cache.objects),
+        len(cache.objects_to_save),
+        tuple(
+            sorted(
+                (
+                    type(obj).__name__,
+                    _explain_obj_identity(obj)[1],
+                    obj._status_,
+                )
+                for obj in cache.objects
+            )
+        ),
+    )
+
+
+class DeleteExplainNode:
+    __slots__ = ("entity", "pk", "action", "is_root", "label")
+
+    def __init__(self, entity, pk, action, is_root=False):
+        self.entity = entity
+        self.pk = pk
+        self.action = action
+        self.is_root = is_root
+        self.label = _explain_identity_label(entity, pk)
+
+    @property
+    def identity(self):
+        return self.entity, self.pk
+
+    def __repr__(self):
+        root = " root" if self.is_root else ""
+        return "<DeleteExplainNode %s action=%s%s>" % (
+            self.label,
+            self.action,
+            root,
+        )
+
+
+class DeleteExplainEdge:
+    __slots__ = (
+        "source",
+        "target",
+        "attr",
+        "reverse_attr",
+        "kind",
+        "orm_action",
+        "db_on_delete",
+        "m2m_table",
+        "reason",
+        "label",
+    )
+
+    def __init__(
+        self,
+        source,
+        target,
+        attr,
+        reverse_attr,
+        kind,
+        orm_action,
+        db_on_delete,
+        m2m_table=None,
+        reason=None,
+    ):
+        self.source = source
+        self.target = target
+        self.attr = attr
+        self.reverse_attr = reverse_attr
+        self.kind = kind
+        self.orm_action = orm_action
+        self.db_on_delete = db_on_delete
+        self.m2m_table = m2m_table
+        self.reason = reason
+        source_label = _explain_identity_label(*source)
+        if target is None:
+            target_label = "?"
+        else:
+            target_label = _explain_identity_label(*target)
+        self.label = "%s --%s--> %s" % (source_label, attr, target_label)
+
+    @property
+    def is_unknown(self):
+        return self.kind == EDGE_UNKNOWN
+
+    def __repr__(self):
+        if self.is_unknown:
+            return "<DeleteExplainEdge %s kind=unknown reason=%s>" % (
+                self.label,
+                self.reason,
+            )
+        return "<DeleteExplainEdge %s kind=%s orm=%s db_on_delete=%s>" % (
+            self.label,
+            self.kind,
+            self.orm_action,
+            self.db_on_delete,
+        )
+
+
+class DeleteExplainGraph:
+    """Read-only deletion impact graph.
+
+    The graph is bound to a concrete mapping (mapping_info) and to the
+    session observation version (observation_version) captured while it was
+    built. Concurrent writers may change the database afterwards, so the real
+    delete() outcome is allowed to differ from this preview; the API neither
+    promises lock-free preview/execute atomicity nor takes any database locks
+    (preview queries are plain SELECTs). Use is_observation_stale() to check
+    whether the current session still matches the captured observation.
+    """
+
+    __slots__ = (
+        "status",
+        "roots",
+        "nodes",
+        "edges",
+        "blockers",
+        "unknown_edges",
+        "budgets",
+        "used",
+        "mapping_info",
+        "session_info",
+        "observation_version",
+        "_database",
+        "_cache_num",
+    )
+
+    def __init__(
+        self,
+        database,
+        cache,
+        roots,
+        nodes,
+        edges,
+        blockers,
+        unknown_edges,
+        budgets,
+        used,
+        status,
+    ):
+        self._database = database
+        self._cache_num = cache.num
+        self.roots = tuple(roots)
+        self.nodes = nodes
+        self.edges = edges
+        self.blockers = blockers
+        self.unknown_edges = unknown_edges
+        self.budgets = budgets
+        self.used = used
+        self.status = status
+        self.mapping_info = {
+            "database_id": database.id,
+            "schema_id": id(database.schema),
+            "provider": database.provider.dialect,
+        }
+        self.session_info = {
+            "session_num": cache.num,
+            "modified": cache.modified,
+            "objects_in_identity_map": len(cache.objects),
+        }
+        self.observation_version = _explain_snapshot_session(cache)
+
+    @property
+    def is_complete(self):
+        return self.status == EXPLAIN_STATUS_COMPLETE
+
+    @property
+    def is_incomplete(self):
+        return self.status == EXPLAIN_STATUS_INCOMPLETE
+
+    @property
+    def has_blockers(self):
+        return bool(self.blockers)
+
+    @property
+    def is_executable(self):
+        """A fully explored graph without required-relationship blockers."""
+        return self.is_complete and not self.blockers
+
+    def deleted_identities(self):
+        return [
+            node.identity
+            for node in self.nodes.values()
+            if node.action == NODE_ACTION_DELETE
+        ]
+
+    def deleted_pks_by_entity(self):
+        result = {}
+        for node in self.nodes.values():
+            if node.action == NODE_ACTION_DELETE:
+                result.setdefault(node.entity, set()).add(node.pk)
+        return result
+
+    def edges_of_kind(self, kind):
+        return [edge for edge in self.edges if edge.kind == kind]
+
+    def is_observation_stale(self):
+        cache = local.db2cache.get(self._database)
+        if cache is None or not cache.is_alive or cache.num != self._cache_num:
+            return True
+        return _explain_snapshot_session(cache) != self.observation_version
+
+    def __repr__(self):
+        return (
+            "<DeleteExplainGraph status=%s nodes=%d edges=%d blockers=%d "
+            "unknown=%d used=%s>"
+            % (
+                self.status,
+                len(self.nodes),
+                len(self.edges),
+                len(self.blockers),
+                len(self.unknown_edges),
+                self.used,
+            )
+        )
+
+
+class _DeleteExplainBuilder:
+    def __init__(self, roots, max_nodes, max_edges, max_sql, load_allow):
+        self.roots = roots
+        self.max_nodes = max_nodes
+        self.max_edges = max_edges
+        self.max_sql = max_sql
+        self.load_allow = load_allow  # None: all relations loadable; set: allow-list
+        self.database = roots[0]._database_
+        self.cache = roots[0]._session_cache_
+        self.nodes = {}
+        self.edges = []
+        self.edge_keys = set()
+        self.blockers = []
+        self.unknown_edges = []
+        self.queue = []
+        self.processed = set()
+        self.used = {"nodes": 0, "edges": 0, "sql": 0}
+        self.incomplete = False
+
+    def _sql_count(self):
+        stat = self.database.local_stats.get(None)
+        return stat.db_count if stat is not None else 0
+
+    def _can_load(self, attr):
+        if self.load_allow is None:
+            return True
+        return attr in self.load_allow
+
+    def _add_node(self, obj, action, is_root=False):
+        identity = _explain_obj_identity(obj)
+        node = self.nodes.get(identity)
+        if node is None:
+            if (
+                not is_root
+                and self.max_nodes is not None
+                and self.used["nodes"] >= self.max_nodes
+            ):
+                return None
+            node = DeleteExplainNode(
+                identity[0], identity[1], action, is_root=is_root
+            )
+            self.nodes[identity] = node
+            self.used["nodes"] += 1
+            # Only objects that would themselves be deleted get their own
+            # relationships expanded, mirroring Entity._delete_() which never
+            # recurses into objects that merely survive an unlink.
+            if action == NODE_ACTION_DELETE:
+                self.queue.append(obj)
+        else:
+            if is_root:
+                node.is_root = True
+            if _ACTION_PRECEDENCE[action] > _ACTION_PRECEDENCE[node.action]:
+                old_action = node.action
+                node.action = action
+                # A node first observed as surviving/blocked may later turn
+                # out to be cascade-deleted through another path.
+                if (
+                    old_action != NODE_ACTION_DELETE
+                    and action == NODE_ACTION_DELETE
+                    and identity in self.processed
+                ):
+                    self.processed.discard(identity)
+                    self.queue.append(obj)
+        return node
+
+    def _add_edge(self, source_id, target_id, attr, reverse, kind, orm_action,
+                  db_on_delete, m2m_table=None):
+        attr_label = "%s.%s" % (attr.entity.__name__, attr.name)
+        reverse_label = "%s.%s" % (reverse.entity.__name__, reverse.name)
+        key = (source_id, attr_label, target_id, kind)
+        if key in self.edge_keys:
+            return
+        if (
+            self.max_edges is not None
+            and self.used["edges"] >= self.max_edges
+        ):
+            self._add_unknown_edge(source_id, attr, "edge_budget")
+            return
+        edge = DeleteExplainEdge(
+            source_id,
+            target_id,
+            attr_label,
+            reverse_label,
+            kind,
+            orm_action,
+            db_on_delete,
+            m2m_table=m2m_table,
+        )
+        self.edge_keys.add(key)
+        self.edges.append(edge)
+        self.used["edges"] += 1
+        if kind == EDGE_REQUIRED_BLOCKER:
+            self.blockers.append(edge)
+
+    def _add_unknown_edge(self, source_id, attr, reason):
+        attr_label = "%s.%s" % (attr.entity.__name__, attr.name)
+        key = (source_id, attr_label, None, EDGE_UNKNOWN, reason)
+        if key in self.edge_keys:
+            return
+        edge = DeleteExplainEdge(
+            source_id,
+            None,
+            attr_label,
+            "%s.%s" % (attr.reverse.entity.__name__, attr.reverse.name),
+            EDGE_UNKNOWN,
+            "unknown",
+            None,
+            reason=reason,
+        )
+        self.edge_keys.add(key)
+        self.edges.append(edge)
+        self.unknown_edges.append(edge)
+        self.incomplete = True
+
+    def _load_collection(self, obj, attr):
+        """Load a collection within the SQL budget. Returns setdata or None."""
+        if not self._can_load(attr):
+            return None, "load_disallowed"
+        if self.max_sql is not None and self.used["sql"] >= self.max_sql:
+            return None, "sql_budget"
+        before = self._sql_count()
+        setdata = attr.load(obj)
+        self.used["sql"] += self._sql_count() - before
+        if self.max_sql is not None and self.used["sql"] > self.max_sql:
+            self.incomplete = True
+        return setdata, None
+
+    def _load_scalar(self, obj, attr):
+        """Load a scalar relation within the SQL budget. Returns value or sentinel."""
+        if not self._can_load(attr):
+            return NOT_LOADED, "load_disallowed"
+        if self.max_sql is not None and self.used["sql"] >= self.max_sql:
+            return NOT_LOADED, "sql_budget"
+        before = self._sql_count()
+        value = attr.load(obj)
+        self.used["sql"] += self._sql_count() - before
+        if self.max_sql is not None and self.used["sql"] > self.max_sql:
+            self.incomplete = True
+        return value, None
+
+    def _connect(self, source_obj, attr, target_obj, kind, orm_action,
+                  db_on_delete, target_action, m2m_table=None):
+        source_id = _explain_obj_identity(source_obj)
+        target_node = self._add_node(target_obj, target_action)
+        if target_node is None:
+            self._add_unknown_edge(source_id, attr, "node_budget")
+            return
+        self._add_edge(
+            source_id,
+            target_node.identity,
+            attr,
+            attr.reverse,
+            kind,
+            orm_action,
+            db_on_delete,
+            m2m_table=m2m_table,
+        )
+
+    def _process_collections(self, obj):
+        for attr in obj._attrs_:
+            if not attr.is_collection or not isinstance(attr, Set):
+                continue
+            reverse = attr.reverse
+            setdata = obj._vals_.get(attr)
+            if setdata is None or not setdata.is_fully_loaded:
+                # An unloaded collection must never be treated as empty.
+                setdata, fail_reason = self._load_collection(obj, attr)
+                if setdata is None:
+                    self._add_unknown_edge(
+                        _explain_obj_identity(obj), attr, fail_reason
+                    )
+                    continue
+            if not setdata:
+                continue
+            if attr.cascade_delete:
+                for robj in list(setdata):
+                    self._connect(
+                        obj,
+                        attr,
+                        robj,
+                        EDGE_CASCADE_DELETE,
+                        "recursive_delete",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_DELETE,
+                    )
+            elif reverse.is_collection:
+                # Many-to-many: link-table rows are removed, both ends survive.
+                for robj in list(setdata):
+                    self._connect(
+                        obj,
+                        attr,
+                        robj,
+                        EDGE_M2M_CLEANUP,
+                        "delete_m2m_link_rows",
+                        "CASCADE",
+                        NODE_ACTION_DETACHED,
+                        m2m_table=attr.table,
+                    )
+            elif not reverse.is_required:
+                for robj in list(setdata):
+                    self._connect(
+                        obj,
+                        attr,
+                        robj,
+                        EDGE_NULLABLE_UNLINK,
+                        "clear_collection_set_null",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_DETACHED,
+                    )
+            else:
+                # Same condition that makes Entity._delete_() raise
+                # ConstraintError: non-empty required set without cascade.
+                for robj in list(setdata):
+                    self._connect(
+                        obj,
+                        attr,
+                        robj,
+                        EDGE_REQUIRED_BLOCKER,
+                        "raise_constraint_error",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_BLOCKED,
+                    )
+
+    def _process_scalar_relations(self, obj):
+        for attr in obj._attrs_:
+            if attr.is_collection or not attr.reverse:
+                continue
+            reverse = attr.reverse
+            source_id = _explain_obj_identity(obj)
+            if not reverse.is_collection:
+                if attr not in obj._vals_:
+                    # Entity._delete_() would load this relation itself.
+                    value, fail_reason = self._load_scalar(obj, attr)
+                    if value is NOT_LOADED:
+                        self._add_unknown_edge(source_id, attr, fail_reason)
+                        continue
+                else:
+                    value = obj._vals_.get(attr)
+                if value is None:
+                    continue
+                if attr.cascade_delete:
+                    self._connect(
+                        obj,
+                        attr,
+                        value,
+                        EDGE_CASCADE_DELETE,
+                        "recursive_delete",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_DELETE,
+                    )
+                elif not reverse.is_required:
+                    self._connect(
+                        obj,
+                        attr,
+                        value,
+                        EDGE_NULLABLE_UNLINK,
+                        "set_reverse_null",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_DETACHED,
+                    )
+                else:
+                    self._connect(
+                        obj,
+                        attr,
+                        value,
+                        EDGE_REQUIRED_BLOCKER,
+                        "raise_constraint_error",
+                        _explain_db_on_delete(attr, reverse),
+                        NODE_ACTION_BLOCKED,
+                    )
+            else:
+                # Reverse side is a collection. Entity._delete_() only updates
+                # the already-loaded reverse collection (pure identity-map
+                # bookkeeping, no extra SQL) and skips the attribute entirely
+                # when it was not loaded, so an unloaded attribute here is not
+                # an unknown frontier.
+                if attr not in obj._vals_:
+                    continue
+                value = obj._vals_.get(attr)
+                if value is None:
+                    continue
+                self._connect(
+                    obj,
+                    attr,
+                    value,
+                    EDGE_REVERSE_COLLECTION_REMOVE,
+                    "remove_member_from_loaded_collection",
+                    None,
+                    NODE_ACTION_DETACHED,
+                )
+
+    def build(self):
+        # flush_disabled() guarantees preview loads never auto-flush dirty
+        # objects. Only plain SELECT statements are issued; no locks are taken
+        # and nothing is marked for deletion or unlinked in the session.
+        with self.cache.flush_disabled():
+            for root in self.roots:
+                self._add_node(root, NODE_ACTION_DELETE, is_root=True)
+            while self.queue:
+                obj = self.queue.pop(0)
+                identity = _explain_obj_identity(obj)
+                if identity in self.processed:
+                    continue
+                if obj._status_ in del_statuses:
+                    # Already marked_to_delete in this session: its
+                    # relationships are being torn down, do not re-expand.
+                    self.processed.add(identity)
+                    continue
+                node = self.nodes.get(identity)
+                if node is not None and node.action != NODE_ACTION_DELETE:
+                    # Surviving/blocked objects are never recursively deleted
+                    self.processed.add(identity)
+                    continue
+                self.processed.add(identity)
+                self._process_collections(obj)
+                self._process_scalar_relations(obj)
+        status = (
+            EXPLAIN_STATUS_INCOMPLETE if self.incomplete
+            else EXPLAIN_STATUS_COMPLETE
+        )
+        return DeleteExplainGraph(
+            self.database,
+            self.cache,
+            (_explain_obj_identity(root) for root in self.roots),
+            self.nodes,
+            self.edges,
+            self.blockers,
+            self.unknown_edges,
+            {
+                "max_nodes": self.max_nodes,
+                "max_edges": self.max_edges,
+                "max_sql": self.max_sql,
+            },
+            dict(self.used),
+            status,
+        )
+
+
 class Entity(metaclass=EntityMeta):
     __slots__ = (
         "__weakref__",
@@ -7473,6 +8124,189 @@ class Entity(metaclass=EntityMeta):
         if cache is None or not cache.is_alive:
             throw_db_session_is_over("delete object", self)
         self._delete_()
+
+    @cut_traceback
+    def explain_delete(
+        self,
+        *roots,
+        max_nodes=None,
+        max_edges=None,
+        max_sql=None,
+        load=True,
+    ):
+        """Build a read-only deletion impact graph for an explicit root set.
+
+        ``Node.explain_delete(n1, n2)`` (or ``n1.explain_delete(n2)``) returns
+        a :class:`DeleteExplainGraph` describing what ``delete()`` would do to
+        the roots and their relationships. The analysis reuses the same
+        ``cascade_delete`` / ``reverse`` / ``reverse.is_required`` semantics as
+        :meth:`_delete_`; it never invokes deletion itself.
+
+        Graph contents:
+          * nodes marked ``delete``: roots and objects reached through
+            cascade_delete relationships;
+          * ``nullable_unlink`` edges: nullable reverse relations that would
+            be set to NULL / cleared, with the related objects surviving;
+          * ``m2m_cleanup`` edges: many-to-many link-table rows that would be
+            removed, with both endpoints surviving;
+          * ``required_blocker`` edges: required relationships without
+            cascade_delete, for which the real delete() raises
+            ConstraintError;
+          * ``unknown`` edges: frontiers that could not be observed. Cycles
+            and descendants shared by several roots are deduplicated by full
+            entity identity (entity class + complete primary key).
+
+        Read-only guarantees: no object is marked for deletion, no
+        relationship is cleared and dirty objects are not flushed (the whole
+        analysis runs with flush disabled and issues plain SELECTs only; no
+        database locks are acquired). Unloaded collections or relations are
+        never treated as empty.
+
+        Restricted loading: ``load=True`` (default) allows loading the
+        relations required for the analysis, ``load=False`` forbids every
+        load, and an iterable of :class:`Attribute` objects restricts loading
+        to an explicit allow-list.
+
+        Budgets: ``max_nodes``, ``max_edges`` and ``max_sql`` (positive ints
+        or ``None``) cap the number of graph nodes, graph edges and SQL
+        statements issued by the preview. When a budget is exhausted the
+        returned graph has ``status == "incomplete"`` and the unobserved
+        frontier is preserved as ``unknown`` edges instead of being silently
+        dropped.
+
+        The report is bound to the current mapping and a session observation
+        version (see ``mapping_info`` / ``observation_version`` and
+        :meth:`DeleteExplainGraph.is_observation_stale`). Concurrent writes
+        may make the eventual real delete() differ; the API does not promise
+        atomicity between preview and execution and never locks the database
+        to make a preview stable. Error messages and node labels contain
+        entity types and primary keys only, never ordinary attribute values.
+        """
+        all_roots = [deref_proxy(self)]
+        all_roots.extend(deref_proxy(root) for root in roots)
+
+        database = None
+        cache = None
+        seen_identities = set()
+        unique_roots = []
+        for obj in all_roots:
+            if not isinstance(obj, Entity):
+                throw(
+                    TypeError,
+                    "explain_delete() expects Entity instances as roots. "
+                    "Got: %r" % type(obj).__name__,
+                )
+            obj_database = obj._database_
+            if obj_database.schema is None:
+                throw(
+                    DeleteExplainError,
+                    "Cannot explain delete of %s: mapping is not generated "
+                    "for entity %s"
+                    % (
+                        _explain_identity_label(
+                            obj.__class__,
+                            obj._get_raw_pkval_()
+                            if obj._pkval_ is not None
+                            else ("__new__", obj._newid_),
+                        ),
+                        obj.__class__.__name__,
+                    ),
+                )
+            obj_cache = obj._session_cache_
+            if obj_cache is None or not obj_cache.is_alive:
+                throw(
+                    DatabaseSessionIsOver,
+                    "Cannot explain delete of %s: the database session is over"
+                    % _explain_identity_label(
+                        obj.__class__,
+                        obj._get_raw_pkval_()
+                        if obj._pkval_ is not None
+                        else ("__new__", obj._newid_),
+                    ),
+                )
+            if obj._status_ in del_statuses:
+                throw(
+                    DeleteExplainError,
+                    "Cannot explain delete of %s: object was %s"
+                    % (
+                        _explain_identity_label(
+                            obj.__class__,
+                            obj._get_raw_pkval_()
+                            if obj._pkval_ is not None
+                            else ("__new__", obj._newid_),
+                        ),
+                        obj._status_.replace("_", " "),
+                    ),
+                )
+            identity = _explain_obj_identity(obj)
+            if database is None:
+                database = obj_database
+                cache = obj_cache
+            elif obj_database is not database:
+                throw(
+                    DeleteExplainError,
+                    "explain_delete() roots must belong to the same Database "
+                    "object",
+                )
+            elif obj_cache is not cache:
+                throw(
+                    TransactionError,
+                    "explain_delete() roots must belong to the same database "
+                    "session",
+                )
+            if identity not in seen_identities:
+                seen_identities.add(identity)
+                unique_roots.append(obj)
+
+        for budget_name, budget_value in (
+            ("max_nodes", max_nodes),
+            ("max_edges", max_edges),
+            ("max_sql", max_sql),
+        ):
+            if budget_value is not None and (
+                isinstance(budget_value, bool)
+                or not isinstance(budget_value, int)
+                or budget_value < 0
+            ):
+                throw(
+                    TypeError,
+                    "%s must be a non-negative integer or None. Got: %r"
+                    % (budget_name, budget_value),
+                )
+
+        if load is True:
+            load_allow = None
+        elif load is False:
+            load_allow = frozenset()
+        elif isinstance(load, Attribute):
+            load_allow = frozenset((load,))
+        else:
+            try:
+                load_items = tuple(load)
+            except TypeError:
+                throw(
+                    TypeError,
+                    "'load' must be True, False or an iterable of relationship "
+                    "Attribute objects. Got: %r" % type(load).__name__,
+                )
+            for attr in load_items:
+                if not isinstance(attr, Attribute) or not attr.reverse:
+                    throw(
+                        TypeError,
+                        "'load' allow-list may contain relationship Attribute "
+                        "objects only. Got: %r" % (attr,),
+                    )
+                if attr.entity._database_ is not database:
+                    throw(
+                        DeleteExplainError,
+                        "Attribute %s does not belong to the database of the "
+                        "explain_delete() roots" % attr,
+                    )
+            load_allow = frozenset(load_items)
+
+        return _DeleteExplainBuilder(
+            unique_roots, max_nodes, max_edges, max_sql, load_allow
+        ).build()
 
     @cut_traceback
     def set(self, **kwargs):
