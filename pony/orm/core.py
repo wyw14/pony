@@ -119,8 +119,16 @@ __all__ = [
     "OrmError",
     "PermissionError",
     "PonyRuntimeWarning",
+    "PrefetchEdgeEvent",
+    "PrefetchObserver",
+    "PrefetchPlan",
+    "PrefetchPlanError",
+    "PrefetchPlanLimitError",
+    "PrefetchResult",
     "PrimaryKey",
     "ProgrammingError",
+    "RecordingPrefetchObserver",
+    "TruncatedPrefetch",
     "Required",
     "RollbackException",
     "RowNotFound",
@@ -381,6 +389,14 @@ class UnexpectedError(TransactionError):
         self.original_exc = original_exc
 
 
+class PrefetchPlanError(OrmError):
+    pass
+
+
+class PrefetchPlanLimitError(PrefetchPlanError):
+    pass
+
+
 class ExprEvalError(TranslationError):
     def __init__(self, src, cause):
         assert isinstance(cause, Exception)
@@ -526,6 +542,470 @@ class PrefetchContext:
                 )
             )
             self.relations_to_prefetch_cache[entity] = result
+        return result
+
+
+PREFETCH_PLAN_DEFAULT_MAX_SQL = 100
+PREFETCH_PLAN_DEFAULT_MAX_NODES = 10000
+
+
+def _get_db_statement_count(database):
+    stat = database.local_stats.get(None)
+    if stat is None:
+        return 0
+    return stat.db_count
+
+
+class _PrefetchState:
+    __slots__ = ("id", "entity", "edges", "edge_by_attr")
+
+    def __init__(self, state_id, entity):
+        self.id = state_id
+        self.entity = entity
+        self.edges = []
+        self.edge_by_attr = {}
+
+
+class _PrefetchEdge:
+    __slots__ = ("attr", "target", "max_objects", "max_depth")
+
+    def __init__(self, attr, target, max_objects, max_depth):
+        self.attr = attr
+        self.target = target
+        self.max_objects = max_objects
+        self.max_depth = max_depth
+
+
+class TruncatedPrefetch:
+    """Explicit record of a collection edge whose loading was stopped because
+    the per-edge object budget was reached. The underlying SetData stays partial
+    (is_fully_loaded is False), so subsequent count(), membership tests and lazy
+    loading keep consulting the database instead of trusting a partial cache."""
+
+    __slots__ = ("obj", "attr", "loaded_count", "available_count", "max_objects")
+
+    def __init__(self, obj, attr, loaded_count, available_count, max_objects):
+        self.obj = obj
+        self.attr = attr
+        self.loaded_count = loaded_count
+        self.available_count = available_count
+        self.max_objects = max_objects
+
+    @property
+    def path(self):
+        return "%s.%s" % (self.attr.entity.__name__, self.attr.name)
+
+    def __repr__(self):
+        return (
+            "TruncatedPrefetch(path=%s, obj=%r, loaded=%d, available=%d, max_objects=%d)"
+            % (
+                self.path,
+                self.obj,
+                self.loaded_count,
+                self.available_count,
+                self.max_objects,
+            )
+        )
+
+
+class PrefetchEdgeEvent:
+    """Immutable event describing one processed FSM edge within one layer."""
+
+    __slots__ = (
+        "layer",
+        "state_id",
+        "attr",
+        "source_count",
+        "loaded_count",
+        "sql_count",
+        "truncated_count",
+    )
+
+    def __init__(
+        self, layer, edge, source_count, loaded_count, sql_count, truncated_count
+    ):
+        self.layer = layer
+        self.state_id = edge.target.id
+        self.attr = edge.attr
+        self.source_count = source_count
+        self.loaded_count = loaded_count
+        self.sql_count = sql_count
+        self.truncated_count = truncated_count
+
+    @property
+    def path(self):
+        return "%s.%s" % (self.attr.entity.__name__, self.attr.name)
+
+    def __repr__(self):
+        return (
+            "PrefetchEdgeEvent(path=%s, layer=%d, sources=%d, loaded=%d, sql=%d, truncated=%d)"
+            % (
+                self.path,
+                self.layer,
+                self.source_count,
+                self.loaded_count,
+                self.sql_count,
+                self.truncated_count,
+            )
+        )
+
+
+class PrefetchObserver:
+    """Restricted, lock-free, read-only event sink.
+
+    Observers only receive immutable event records; their return values are
+    ignored and they must not mutate entities, collections or the session.
+    Callbacks are invoked synchronously outside of any lock, so a slow observer
+    never blocks another thread's cache. Raise an exception to abort the run;
+    already confirmed loads keep their truthful loaded flags."""
+
+    def on_layer_begin(self, layer, node_count):
+        pass
+
+    def on_edge_loaded(self, event):
+        pass
+
+    def on_truncated(self, record):
+        pass
+
+    def on_finish(self, result):
+        pass
+
+
+class RecordingPrefetchObserver(PrefetchObserver):
+    """Observer that stores every event for later inspection (still read-only
+    with respect to the ORM state)."""
+
+    def __init__(self):
+        self.layer_events = []
+        self.edge_events = []
+        self.truncated = []
+        self.result = None
+
+    def on_layer_begin(self, layer, node_count):
+        self.layer_events.append((layer, node_count))
+
+    def on_edge_loaded(self, event):
+        self.edge_events.append(event)
+
+    def on_truncated(self, record):
+        self.truncated.append(record)
+
+    def on_finish(self, result):
+        self.result = result
+
+
+class PrefetchResult:
+    __slots__ = ("sql_count", "nodes_visited", "layers", "truncated", "observer")
+
+    def __init__(self, sql_count, nodes_visited, layers, truncated, observer):
+        self.sql_count = sql_count
+        self.nodes_visited = nodes_visited
+        self.layers = layers
+        self.truncated = truncated
+        self.observer = observer
+
+    def __repr__(self):
+        return (
+            "PrefetchResult(sql_count=%d, nodes_visited=%d, layers=%d, truncated=%d)"
+            % (self.sql_count, self.nodes_visited, self.layers, len(self.truncated))
+        )
+
+
+def _prefetch_load_toone_edge(attr, objects):
+    related = []
+    for obj in objects:
+        vals = obj._vals_
+        if attr in vals:
+            val = vals[attr]
+        else:
+            val = attr.get(obj)
+        if val is not None:
+            related.append(val)
+    return related
+
+
+def _extract_prefetch_plan_roots(expr_type, query_result, root_entity):
+    if isinstance(expr_type, EntityMeta):
+        return list(query_result)
+    result = []
+    for i, var_type in enumerate(expr_type):
+        if isinstance(var_type, EntityMeta) and issubclass(var_type, root_entity):
+            for row in query_result:
+                result.append(row[i])
+    return result
+
+
+class PrefetchPlan:
+    """A finite-state prefetch plan compiled from explicit relationship paths.
+
+    Unlike Query.prefetch(), whose budgets are global per entity/attribute,
+    each path position gets its own plan state, so the same entity reached
+    through different paths may carry different depth/object budgets. Paths are
+    built exclusively from relationship Attribute objects - path strings are
+    rejected and never evaluated."""
+
+    def __init__(
+        self,
+        root_entity,
+        max_sql=PREFETCH_PLAN_DEFAULT_MAX_SQL,
+        max_nodes=PREFETCH_PLAN_DEFAULT_MAX_NODES,
+    ):
+        if not isinstance(root_entity, EntityMeta):
+            throw(
+                TypeError,
+                "PrefetchPlan root must be an entity class. Got: %r" % root_entity,
+            )
+        database = root_entity._database_
+        if database is None or database.schema is None:
+            throw(
+                ERDiagramError,
+                "Mapping is not generated for entity %r" % root_entity.__name__,
+            )
+        self._check_positive_int(max_sql, "max_sql")
+        self._check_positive_int(max_nodes, "max_nodes")
+        self._database = database
+        self._root_entity = root_entity
+        self._root = _PrefetchState(0, root_entity)
+        self._states = [self._root]
+        self._max_sql = max_sql
+        self._max_nodes = max_nodes
+        self._locked = False
+
+    @staticmethod
+    def _check_positive_int(value, name):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            throw(
+                ValueError,
+                "%s must be a positive integer. Got: %r" % (name, value),
+            )
+
+    @property
+    def root_entity(self):
+        return self._root_entity
+
+    @property
+    def database(self):
+        return self._database
+
+    @property
+    def max_sql(self):
+        return self._max_sql
+
+    @property
+    def max_nodes(self):
+        return self._max_nodes
+
+    @property
+    def states(self):
+        return tuple(self._states)
+
+    def add_path(self, *attrs, max_objects=None, max_depth=1, edge_limits=None):
+        if self._locked:
+            throw(
+                PrefetchPlanError,
+                "Cannot extend a PrefetchPlan after it has been executed",
+            )
+        if not attrs:
+            throw(
+                TypeError,
+                "add_path() requires at least one relationship attribute",
+            )
+        if edge_limits is not None:
+            if len(edge_limits) != len(attrs):
+                throw(
+                    ValueError,
+                    "edge_limits length %d does not match the number of path "
+                    "attributes %d" % (len(edge_limits), len(attrs)),
+                )
+        else:
+            edge_limits = (None,) * len(attrs)
+        state = self._root
+        for attr, per_edge_limits in zip(attrs, edge_limits, strict=True):
+            edge_max_objects = max_objects
+            edge_max_depth = max_depth
+            if per_edge_limits is not None:
+                if not isinstance(per_edge_limits, dict):
+                    throw(
+                        TypeError,
+                        "edge_limits items must be dicts or None. Got: %r"
+                        % per_edge_limits,
+                    )
+                edge_max_objects = per_edge_limits.get("max_objects", edge_max_objects)
+                edge_max_depth = per_edge_limits.get("max_depth", edge_max_depth)
+            state = self._add_edge(state, attr, edge_max_objects, edge_max_depth)
+        return self
+
+    def _validate_edge(self, state, attr, max_objects, max_depth):
+        if not isinstance(attr, Attribute) or not attr.is_relation:
+            throw(
+                TypeError,
+                "PrefetchPlan paths must consist of relationship Attribute "
+                "objects; string paths are not evaluated. Got: %r" % (attr,),
+            )
+        if not issubclass(state.entity, attr.entity):
+            throw(
+                PrefetchPlanError,
+                "Attribute %s does not belong to entity %s at this path position"
+                % (attr, state.entity.__name__),
+            )
+        target_entity = attr.py_type
+        if (
+            attr.entity._database_ is not self._database
+            or target_entity._database_ is not self._database
+        ):
+            throw(
+                TypeError,
+                "Entity of attribute %s belongs to a different database and "
+                "cannot be used in this PrefetchPlan" % attr,
+            )
+        if max_objects is not None:
+            self._check_positive_int(max_objects, "max_objects")
+            if not attr.is_collection:
+                throw(
+                    PrefetchPlanError,
+                    "max_objects can be set for collection attributes only; "
+                    "%s is a to-one relation" % attr,
+                )
+        self._check_positive_int(max_depth, "max_depth")
+        if max_depth > 1 and target_entity is not attr.entity:
+            throw(
+                PrefetchPlanError,
+                "max_depth > 1 is allowed only for self-referencing attributes; "
+                "%s targets another entity" % attr,
+            )
+        return target_entity
+
+    def _add_edge(self, state, attr, max_objects, max_depth):
+        for _ in range(max_depth):
+            target_entity = self._validate_edge(state, attr, max_objects, max_depth)
+            existing = state.edge_by_attr.get(attr)
+            if existing is not None:
+                if (
+                    existing.max_objects != max_objects
+                    or existing.max_depth != max_depth
+                ):
+                    throw(
+                        PrefetchPlanError,
+                        "Conflicting loading budgets for edge %s at the same "
+                        "plan state" % attr,
+                    )
+                state = existing.target
+                continue
+            target = _PrefetchState(len(self._states), target_entity)
+            self._states.append(target)
+            edge = _PrefetchEdge(attr, target, max_objects, max_depth)
+            state.edges.append(edge)
+            state.edge_by_attr[attr] = edge
+            state = target
+        return state
+
+    def load(self, objects, observer=None):
+        """Execute the plan against already-loaded root objects, performing
+        layered batch loading. The plan, the source Query and its
+        PrefetchContext are not mutated; only the identity map and truthful
+        collection flags of the current session are touched."""
+        if observer is None:
+            observer = PrefetchObserver()
+        elif not isinstance(observer, PrefetchObserver):
+            throw(
+                TypeError,
+                "observer must be a PrefetchObserver instance. Got: %r" % observer,
+            )
+        self._locked = True
+        database = self._database
+        cache = database._get_cache()
+        if cache is None or not cache.is_alive:
+            throw(
+                DatabaseSessionIsOver,
+                "Cannot run PrefetchPlan: the database session is over",
+            )
+        roots = []
+        seen_roots = set()
+        for obj in objects:
+            if not isinstance(obj, self._root_entity):
+                throw(
+                    TypeError,
+                    "PrefetchPlan root object must be an instance of %s. "
+                    "Got: %r" % (self._root_entity.__name__, obj),
+                )
+            if obj._session_cache_ is not cache:
+                throw(
+                    TransactionError,
+                    "An attempt to mix objects belonging to different transactions",
+                )
+            if obj not in seen_roots:
+                seen_roots.add(obj)
+                roots.append(obj)
+
+        visited = set()  # (obj, state.id) - dedup by entity identity AND plan state
+        frontier = {(self._root, obj) for obj in roots}
+        sql_count = 0
+        nodes_visited = 0
+        layers = 0
+        truncated = []
+
+        while frontier:
+            current = [
+                (state, obj)
+                for state, obj in frontier
+                if (obj, state.id) not in visited
+            ]
+            if nodes_visited + len(current) > self._max_nodes:
+                throw(
+                    PrefetchPlanLimitError,
+                    "PrefetchPlan node limit of %d exceeded" % self._max_nodes,
+                )
+            observer.on_layer_begin(layers, len(current))
+            for state, obj in current:
+                visited.add((obj, state.id))
+            nodes_visited += len(current)
+
+            groups = defaultdict(list)
+            for state, obj in current:
+                for edge in state.edges:
+                    groups[edge].append(obj)
+
+            next_frontier = set()
+            for edge, sources in groups.items():
+                before = _get_db_statement_count(database)
+                if edge.attr.is_collection:
+                    related, truncated_here = edge.attr.prefetch_load_limited(
+                        sources, edge.max_objects
+                    )
+                    for record in truncated_here:
+                        truncated.append(record)
+                        observer.on_truncated(record)
+                else:
+                    related = _prefetch_load_toone_edge(edge.attr, sources)
+                    truncated_here = ()
+                edge_sql = _get_db_statement_count(database) - before
+                sql_count += edge_sql
+                if sql_count > self._max_sql:
+                    throw(
+                        PrefetchPlanLimitError,
+                        "PrefetchPlan SQL statement limit of %d exceeded"
+                        % self._max_sql,
+                    )
+                event = PrefetchEdgeEvent(
+                    layers,
+                    edge,
+                    len(sources),
+                    len(related),
+                    edge_sql,
+                    len(truncated_here),
+                )
+                observer.on_edge_loaded(event)
+                for related_obj in related:
+                    next_frontier.add((edge.target, related_obj))
+
+            frontier = next_frontier
+            layers += 1
+
+        result = PrefetchResult(
+            sql_count, nodes_visited, layers, tuple(truncated), observer
+        )
+        observer.on_finish(result)
         return result
 
 
@@ -4300,6 +4780,144 @@ class Set(Collection):
             setdata.count = len(setdata)
         return result
 
+    def prefetch_load_limited(self, objects, max_objects):
+        """Budget-aware batch prefetch used by PrefetchPlan.
+
+        Loads the collections of *objects* in the same batched SQL fashion as
+        prefetch_load_all(), respecting provider.max_params_count for composite
+        primary keys, but never marks a collection is_fully_loaded when its
+        member count exceeds *max_objects*. Such collections keep a truthful
+        partial SetData and produce an explicit TruncatedPrefetch record, so a
+        later count(), membership test or lazy load cannot be fooled by a
+        partial cache. Fully-loaded collections are never re-queried.
+
+        Returns (related_objects, truncated_records). Related objects already
+        present in the identity map are reused; no flags are flipped before the
+        corresponding SQL batch succeeded, so a loading error leaves no false
+        loaded marks behind."""
+        entity = self.entity
+        database = entity._database_
+        cache = database._get_cache()
+        if cache is None or not cache.is_alive:
+            throw(
+                DatabaseSessionIsOver,
+                "Cannot load objects from the database: the database session is over",
+            )
+        reverse = self.reverse
+        rentity = reverse.entity
+        pending = []
+        for obj in objects:
+            setdata = obj._vals_.get(self)
+            if setdata is not None and setdata.is_fully_loaded and not self.is_volatile:
+                continue
+            pending.append(obj)
+        truncated = []
+        if pending:
+            pending = sorted(pending, key=entity._get_raw_pkval_)
+            max_batch_size = database.provider.max_params_count // len(
+                entity._pk_columns_
+            )
+            if not reverse.is_collection:
+                for i in range(0, len(pending), max_batch_size):
+                    batch = pending[i : i + max_batch_size]
+                    sql, adapter, attr_offsets = rentity._construct_batchload_sql_(
+                        len(batch), reverse
+                    )
+                    arguments = adapter(batch)
+                    cursor = database._exec_sql(sql, arguments)
+                    rentity._fetch_objects(cursor, attr_offsets)
+            else:
+                pk_len = len(entity._pk_columns_)
+                m2m_dict = defaultdict(set)
+                for i in range(0, len(pending), max_batch_size):
+                    batch = pending[i : i + max_batch_size]
+                    sql, adapter = self.construct_sql_m2m(len(batch))
+                    arguments = adapter(batch)
+                    cursor = database._exec_sql(sql, arguments)
+                    batch_objects = set()
+                    if len(batch) > 1:
+                        for row in cursor.fetchall():
+                            obj = entity._get_by_raw_pkval_(row[:pk_len])
+                            item = rentity._get_by_raw_pkval_(row[pk_len:])
+                            m2m_dict[obj].add(item)
+                            batch_objects.add(obj)
+                    else:
+                        obj = batch[0]
+                        m2m_dict[obj] = {
+                            rentity._get_by_raw_pkval_(row) for row in cursor.fetchall()
+                        }
+                        batch_objects.add(obj)
+
+                    # Merge only the objects served by this batch; each source
+                    # belongs to exactly one batch, so stale entries from prior
+                    # batches must not be revalidated (their sets were already
+                    # merged and would look like phantom disappearances).
+                    for obj2 in batch_objects:
+                        items = m2m_dict[obj2]
+                        setdata2 = obj2._vals_.get(self)
+                        if setdata2 is None:
+                            setdata2 = obj2._vals_[self] = SetData()
+                        else:
+                            phantoms = setdata2 - items
+                            if setdata2.added:
+                                phantoms -= setdata2.added
+                            if phantoms and not self.is_volatile:
+                                throw(
+                                    UnrepeatableReadError,
+                                    "Phantom object %s disappeared from collection %s.%s"
+                                    % (
+                                        safe_repr(phantoms.pop()),
+                                        safe_repr(obj2),
+                                        self.name,
+                                    ),
+                                )
+                        new_items = items - setdata2
+                        if setdata2.removed:
+                            new_items -= setdata2.removed
+                        setdata2 |= new_items
+                        reverse.db_reverse_add(new_items, obj2)
+
+            # All SQL batches succeeded; only now finalize the loaded flags.
+            for obj in pending:
+                setdata = obj._vals_.get(self)
+                if setdata is None:
+                    setdata = obj._vals_[self] = SetData()
+                if max_objects is not None and len(setdata) > max_objects:
+                    available_count = len(setdata)
+                    added = setdata.added or ()
+                    removable = sorted(
+                        (item for item in setdata if item not in added),
+                        key=rentity._get_raw_pkval_,
+                    )
+                    # keep the first max_objects database-backed members
+                    for item in removable[max_objects:]:
+                        setdata.remove(item)
+                    # Partial cache: keep is_fully_loaded False and do not
+                    # overwrite count, so count()/membership stay database-backed.
+                    truncated.append(
+                        TruncatedPrefetch(
+                            obj,
+                            self,
+                            len(setdata),
+                            available_count,
+                            max_objects,
+                        )
+                    )
+                else:
+                    setdata.is_fully_loaded = True
+                    setdata.absent = None
+                    setdata.count = len(setdata)
+
+        # Rebuild the related set from the current (possibly truncated) cache
+        # of every source, so objects shared through an M2M relation are
+        # propagated to the next layer whenever any source still keeps them.
+        related = set()
+        for obj in objects:
+            setdata = obj._vals_.get(self)
+            if setdata is not None:
+                related.update(setdata)
+        return related, truncated
+
     def load(self, obj, items=None):
         cache = obj._session_cache_
         if cache is None or not cache.is_alive:
@@ -4389,6 +5007,17 @@ class Set(Collection):
             arguments = adapter(objects)
             cursor = database._exec_sql(sql, arguments)
             items = rentity._fetch_objects(cursor, attr_offsets)
+            # Reconcile incomplete collections: a partial cache may miss
+            # members that already live in the identity map (for example a
+            # PrefetchPlan budget truncated this collection), in which case
+            # _fetch_objects performs no reverse-side maintenance for them.
+            for obj2, setdata2 in zip(objects, setdata_list, strict=True):
+                fetched_members = {
+                    member for member in items if member._vals_.get(reverse) is obj2
+                }
+                if setdata2.removed:
+                    fetched_members -= setdata2.removed
+                setdata2 |= fetched_members - setdata2
         else:
             sql, adapter = self.construct_sql_m2m(len(objects))
             arguments = adapter(objects)
@@ -8408,6 +9037,8 @@ class Query:
         self._distinct = None
         self._prefetch = False
         self._prefetch_context = PrefetchContext(self._database)
+        self._prefetch_plan = None
+        self._prefetch_plan_observer = None
 
     def _get_query(self):
         return self
@@ -8538,6 +9169,7 @@ class Query:
                 cache.immediate = True
             cache.prepare_connection_for_query_execution()  # may clear cache.query_results
             items = cache.query_results.get(query_key)
+            fetched_from_database = items is None
             if items is None:
                 cursor = database._exec_sql(sql, arguments)
                 if isinstance(translator.expr_type, EntityMeta):
@@ -8573,6 +9205,17 @@ class Query:
                     stats[sql] = QueryStat(sql)
             if self._prefetch:
                 self._do_prefetch(items)
+            # The same QueryResult may trigger _actual_fetch more than once
+            # (e.g. list() via __length_hint__ and next()); on a cache hit the
+            # plan already ran against these exact objects, and truncated
+            # collections must not be re-queried, so execute only on fresh rows.
+            if self._prefetch_plan is not None and fetched_from_database:
+                root_objects = _extract_prefetch_plan_roots(
+                    self._translator.expr_type,
+                    items,
+                    self._prefetch_plan.root_entity,
+                )
+                self._prefetch_plan.load(root_objects, self._prefetch_plan_observer)
         return items
 
     @cut_traceback
@@ -8608,6 +9251,41 @@ class Query:
                     "Got: %r" % arg,
                 )
         return self
+
+    @cut_traceback
+    def prefetch_plan(self, plan, observer=None):
+        """Attach a compiled PrefetchPlan. Returns a new Query; the original
+        Query and its PrefetchContext are left untouched."""
+        if not isinstance(plan, PrefetchPlan):
+            throw(
+                TypeError,
+                "prefetch_plan() argument must be a PrefetchPlan instance. "
+                "Got: %r" % plan,
+            )
+        if plan.database is not self._database:
+            throw(
+                TypeError,
+                "PrefetchPlan belongs to a different database and cannot be "
+                "applied to this query",
+            )
+        root_entity = plan.root_entity
+        expr_type = self._translator.expr_type
+        if isinstance(expr_type, EntityMeta):
+            type_matches = issubclass(expr_type, root_entity)
+        elif type(expr_type) is tuple:
+            type_matches = any(
+                isinstance(var_type, EntityMeta) and issubclass(var_type, root_entity)
+                for var_type in expr_type
+            )
+        else:
+            type_matches = False
+        if not type_matches:
+            throw(
+                TypeError,
+                "PrefetchPlan root entity %s does not match the entities "
+                "returned by this query" % root_entity.__name__,
+            )
+        return self._clone(_prefetch_plan=plan, _prefetch_plan_observer=observer)
 
     def _do_prefetch(self, query_result):
         expr_type = self._translator.expr_type
