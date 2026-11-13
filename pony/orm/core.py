@@ -9,7 +9,7 @@ import re
 import sys
 import types
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from decimal import Decimal
 from functools import wraps
@@ -94,6 +94,7 @@ __all__ = [
     "DatabaseContainsIncorrectValue",
     "DatabaseError",
     "DatabaseSessionIsOver",
+    "DirtySessionReadError",
     "Discriminator",
     "ERDiagramError",
     "Error",
@@ -121,6 +122,8 @@ __all__ = [
     "PonyRuntimeWarning",
     "PrimaryKey",
     "ProgrammingError",
+    "ReadBudgetError",
+    "ReadBudgetExceeded",
     "Required",
     "RollbackException",
     "RowNotFound",
@@ -136,6 +139,7 @@ __all__ = [
     "UnexpectedError",
     "UnrepeatableReadError",
     "UnresolvableCyclicDependency",
+    "UnsafeRawStatementError",
     "Warning",
     "avg",
     "between",
@@ -171,6 +175,7 @@ __all__ = [
     "select",
     "set_current_user",
     "set_sql_debug",
+    "SessionReadBudget",
     "show",
     "sql_debug",
     "sql_debugging",
@@ -529,6 +534,465 @@ class PrefetchContext:
         return result
 
 
+# ===========================================================================
+# Session read budget
+# ===========================================================================
+
+READ_BUDGET_ON_DIRTY_REJECT = "reject"
+READ_BUDGET_ON_DIRTY_ALLOW = "allow"
+MAX_READ_BUDGET_PATH_DEPTH = 8
+MAX_READ_BUDGET_PATH_PART_LEN = 120
+MAX_READ_BUDGET_EVENTS = 20
+_READ_BUDGET_FETCH_BATCH = 1000
+
+
+class ReadBudgetError(OrmError):
+    """Base class for errors raised by SessionReadBudget."""
+
+
+class ReadBudgetExceeded(ReadBudgetError):
+    def __init__(self, limit_type, limit, used, path, database=None):
+        self.limit_type = limit_type
+        self.limit = limit
+        self.used = used
+        self.path = tuple(path)
+        self.database = database
+        path_str = (
+            " -> ".join("/".join(part) for part in self.path)
+            if self.path
+            else "<unknown>"
+        )
+        ReadBudgetError.__init__(
+            self,
+            "Read budget %s limit of %s exceeded (already used %s) at path: %s"
+            % (limit_type, limit, used, path_str),
+        )
+
+
+class UnsafeRawStatementError(ReadBudgetError):
+    def __init__(self, sql, path):
+        self.sql = sql
+        self.path = tuple(path)
+        ReadBudgetError.__init__(
+            self,
+            "Refusing to execute an unclassified raw SQL statement while a "
+            "strict SessionReadBudget is active. Use Database.select/get/exists "
+            "for read-only statements, or construct the budget with "
+            "strict=False to let unclassified statements bypass it. SQL: %s"
+            % truncate_repr(sql),
+        )
+
+
+class DirtySessionReadError(ReadBudgetError):
+    def __init__(self, path):
+        self.path = tuple(path)
+        path_str = (
+            " -> ".join("/".join(part) for part in self.path)
+            if self.path
+            else "<unknown>"
+        )
+        ReadBudgetError.__init__(
+            self,
+            "Refusing to perform a budgeted read because the session contains "
+            "dirty objects which would be flushed automatically before the "
+            "read. Flush or rollback the changes first, or construct the "
+            'budget with on_dirty="allow". Read path: %s' % path_str,
+        )
+
+
+def normalized_result_size(value):
+    # Deterministic estimate of the client-side volume of a fetched value.
+    # It intentionally does NOT estimate server-side scan or execution cost.
+    t = type(value)
+    if value is None:
+        return 0
+    if t is str:
+        return len(value.encode("utf-8", "replace"))
+    if t is bytes or t is bytearray or isinstance(value, buffer):
+        return len(value)
+    if t is bool:
+        return 1
+    if t is int:
+        return len(str(value))
+    if t is float:
+        return len(repr(value))
+    if t is tuple or t is list:
+        return 1 + builtins.sum(normalized_result_size(item) for item in value)
+    if t is dict:
+        total = 1
+        for key, val in value.items():
+            total += normalized_result_size(key) + normalized_result_size(val)
+        return total
+    if t is set or t is frozenset:
+        return 1 + builtins.sum(normalized_result_size(item) for item in value)
+    return len(repr(value).encode("utf-8", "replace"))
+
+
+class _ReadBudgetCounters:
+    __slots__ = ("sql_count", "rows", "result_bytes", "events")
+
+    def __init__(self):
+        self.sql_count = 0
+        self.rows = 0
+        self.result_bytes = 0
+        self.events = deque(maxlen=MAX_READ_BUDGET_EVENTS)
+
+    def snapshot(self):
+        return dict(
+            sql_count=self.sql_count,
+            rows=self.rows,
+            result_bytes=self.result_bytes,
+        )
+
+
+class _ReadBudgetAccount:
+    __slots__ = ("budget", "db2counters")
+
+    def __init__(self, budget):
+        self.budget = budget
+        self.db2counters = {}
+
+    def counters(self, database, create=False):
+        counters = self.db2counters.get(database)
+        if counters is None and create:
+            counters = _ReadBudgetCounters()
+            self.db2counters[database] = counters
+        return counters
+
+
+def _truncate_path_part(part):
+    part = tostring(part)
+    if len(part) > MAX_READ_BUDGET_PATH_PART_LEN:
+        part = part[: MAX_READ_BUDGET_PATH_PART_LEN - 3] + "..."
+    return part
+
+
+def _build_read_path(path):
+    frames = list(local.read_path_stack)
+    if path:
+        frames.append(tuple(path))
+    if len(frames) > MAX_READ_BUDGET_PATH_DEPTH:
+        frames = frames[-MAX_READ_BUDGET_PATH_DEPTH:]
+    return tuple(
+        tuple(_truncate_path_part(part) for part in frame) for frame in frames
+    )
+
+
+@contextmanager
+def read_path(*frame):
+    local.read_path_stack.append(tuple(frame))
+    try:
+        yield
+    finally:
+        local.read_path_stack.pop()
+
+
+def _record_budget_event(database, kind, path, sql_count, rows, result_bytes):
+    for account in local.read_budget_stack:
+        counters = account.counters(database, create=True)
+        counters.events.append(
+            (kind, tuple(path), sql_count, rows, result_bytes)
+        )
+
+
+def _reserve_read_sql(database, path):
+    # The reservation is made BEFORE the statement reaches the DBAPI driver.
+    stack = local.read_budget_stack
+    for account in stack:
+        limit = account.budget.max_sql_count
+        if limit is not None:
+            counters = account.counters(database, create=True)
+            if counters.sql_count >= limit:
+                raise ReadBudgetExceeded(
+                    "sql_count", limit, counters.sql_count, path, database
+                )
+    for account in stack:
+        account.counters(database, create=True).sql_count += 1
+    _record_budget_event(database, "sql", path, 1, 0, 0)
+
+
+def _remaining_read_rows(database):
+    result = None
+    for account in local.read_budget_stack:
+        limit = account.budget.max_rows
+        if limit is None:
+            continue
+        counters = account.counters(database)
+        used = counters.rows if counters is not None else 0
+        remaining = limit - used
+        if result is None or remaining < result:
+            result = remaining
+    return result
+
+
+def _check_read_row_capacity(database, path):
+    for account in local.read_budget_stack:
+        limit = account.budget.max_rows
+        if limit is not None:
+            counters = account.counters(database)
+            used = counters.rows if counters is not None else 0
+            if used >= limit:
+                raise ReadBudgetExceeded("rows", limit, used, path, database)
+
+
+def _charge_read_fetch(database, rows, result_bytes, path):
+    stack = local.read_budget_stack
+    # Settle the batch on every active account first so the counters always
+    # reflect the volume physically pulled from the DBAPI driver, then
+    # reject further expansion when a quota is exceeded.
+    for account in stack:
+        counters = account.counters(database, create=True)
+        counters.rows += rows
+        counters.result_bytes += result_bytes
+    for account in stack:
+        counters = account.counters(database)
+        limit = account.budget.max_rows
+        if limit is not None and counters.rows > limit:
+            raise ReadBudgetExceeded(
+                "rows", limit, counters.rows, path, database
+            )
+        limit = account.budget.max_result_bytes
+        if limit is not None and counters.result_bytes > limit:
+            raise ReadBudgetExceeded(
+                "result_bytes",
+                limit,
+                counters.result_bytes,
+                path,
+                database,
+            )
+    _record_budget_event(database, "fetch", path, 0, rows, result_bytes)
+
+
+def _check_dirty_session_read(cache, path):
+    stack = local.read_budget_stack
+    if not stack:
+        return
+    budget = stack[-1].budget
+    if (
+        budget.on_dirty == READ_BUDGET_ON_DIRTY_REJECT
+        and cache.modified
+        and not cache.noflush_counter
+    ):
+        raise DirtySessionReadError(path)
+
+
+class _BudgetCursor:
+    # Wraps a real DBAPI cursor so that every fetch boundary settles the
+    # active read budgets before more rows can be pulled from the driver.
+    def __init__(self, cursor, database, path):
+        self._budget_cursor = cursor
+        self._budget_database = database
+        self._budget_path = path
+
+    def fetchone(self):
+        _check_read_row_capacity(self._budget_database, self._budget_path)
+        row = self._budget_cursor.fetchone()
+        if row is not None:
+            _charge_read_fetch(
+                self._budget_database,
+                1,
+                normalized_result_size(row),
+                self._budget_path,
+            )
+        return row
+
+    def fetchmany(self, size=None):
+        if size is None:
+            size = getattr(self._budget_cursor, "arraysize", 1)
+        remaining = _remaining_read_rows(self._budget_database)
+        if remaining is not None and size > remaining:
+            size = remaining
+        if size <= 0:
+            # Raises ReadBudgetExceeded with the tightest active limit.
+            _check_read_row_capacity(self._budget_database, self._budget_path)
+            return self._budget_cursor.fetchmany(0)
+        rows = self._budget_cursor.fetchmany(size)
+        if rows:
+            result_bytes = builtins.sum(
+                normalized_result_size(row) for row in rows
+            )
+            _charge_read_fetch(
+                self._budget_database, len(rows), result_bytes, self._budget_path
+            )
+        return rows
+
+    def fetchall(self):
+        result = []
+        while True:
+            batch = self.fetchmany(_READ_BUDGET_FETCH_BATCH)
+            if not batch:
+                return result
+            result.extend(batch)
+
+    def __getattr__(self, name):
+        return getattr(self._budget_cursor, name)
+
+
+class SessionReadBudget:
+    """Optional per-Database read budget for the current db_session/thread.
+
+    Limits the number of read SQL statements actually sent to the database
+    driver, the number of rows fetched on the client side and a normalized
+    estimate of the fetched result bytes. Identity map and query result cache
+    hits cost nothing because no SQL is executed.
+
+    Row and byte quotas constrain client-side reads only; they make no claim
+    about server-side table scans or execution time.
+
+    Nested contexts intersect their remaining quotas: the effective limit is
+    the smallest remainder across the active stack. Exiting (or failing inside)
+    an inner context never resets outer counters, and mutable counters are
+    never shared between threads or sessions.
+
+    Explicit raw read APIs (Database.select/get/exists and Entity
+    select_by_sql/get_by_sql) are accounted as reads. A generic
+    Database.execute() statement cannot be proven read-only from its text, so
+    strict budgets (the default) reject it instead of guessing its side
+    effects from a string prefix; strict=False lets such statements bypass
+    accounting.
+
+    The budget never flushes dirty objects itself. With the default
+    on_dirty="reject" policy a budgeted read that would trigger an automatic
+    flush raises DirtySessionReadError; on_dirty="allow" keeps the normal
+    pre-query flush behavior (flush writes are not counted as reads) and
+    never commits implicitly.
+    """
+
+    def __init__(
+        self,
+        max_sql_count=None,
+        max_rows=None,
+        max_result_bytes=None,
+        strict=True,
+        on_dirty=READ_BUDGET_ON_DIRTY_REJECT,
+        name=None,
+    ):
+        for param_name, value in (
+            ("max_sql_count", max_sql_count),
+            ("max_rows", max_rows),
+            ("max_result_bytes", max_result_bytes),
+        ):
+            if value is not None and (
+                not isinstance(value, int_types) or value < 0
+            ):
+                throw(
+                    TypeError,
+                    "%s must be a non-negative int or None. Got: %r"
+                    % (param_name, value),
+                )
+        if on_dirty not in (
+            READ_BUDGET_ON_DIRTY_REJECT,
+            READ_BUDGET_ON_DIRTY_ALLOW,
+        ):
+            throw(
+                ValueError,
+                'on_dirty must be "reject" or "allow". Got: %r' % on_dirty,
+            )
+        self.max_sql_count = max_sql_count
+        self.max_rows = max_rows
+        self.max_result_bytes = max_result_bytes
+        self.strict = strict
+        self.on_dirty = on_dirty
+        self.name = name
+        # Last account per thread: counters must never be shared between
+        # threads, and introspection after __exit__ still needs the final
+        # state of the account that belonged to the calling thread.
+        self._accounts_by_thread = {}
+
+    def _account(self):
+        for account in reversed(local.read_budget_stack):
+            if account.budget is self:
+                return account
+        return None
+
+    def _introspect_account(self):
+        account = self._account()
+        if account is not None:
+            return account
+        return self._accounts_by_thread.get(current_thread().ident)
+
+    def __enter__(self):
+        account = _ReadBudgetAccount(self)
+        local.read_budget_stack.append(account)
+        self._accounts_by_thread[current_thread().ident] = account
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        stack = local.read_budget_stack
+        account = self._account()
+        if account is None:
+            throw(
+                RuntimeError,
+                "SessionReadBudget was exited in a different thread or "
+                "without being entered",
+            )
+        index = len(stack) - 1 - stack[::-1].index(account)
+        # Remove this account and anything above it; outer accounts keep
+        # their mutable counters untouched even when an exception propagated.
+        del stack[index:]
+
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    @classmethod
+    def is_active(cls):
+        return bool(local.read_budget_stack)
+
+    def usage(self, database):
+        """Own counters of this context for the given database."""
+        account = self._introspect_account()
+        if account is None:
+            return dict(sql_count=0, rows=0, result_bytes=0)
+        counters = account.counters(database)
+        if counters is None:
+            return dict(sql_count=0, rows=0, result_bytes=0)
+        return counters.snapshot()
+
+    def remaining(self, database):
+        """Effective remaining quotas: intersection of the active stack."""
+        result = dict(sql_count=None, rows=None, result_bytes=None)
+        live_account = self._account()
+        if live_account is not None:
+            accounts = list(local.read_budget_stack)
+        else:
+            account = self._introspect_account()
+            accounts = [account] if account is not None else []
+        for account in accounts:
+            budget = account.budget
+            counters = account.counters(database)
+            used = (
+                counters.snapshot()
+                if counters is not None
+                else dict(sql_count=0, rows=0, result_bytes=0)
+            )
+            for key, limit in (
+                ("sql_count", budget.max_sql_count),
+                ("rows", budget.max_rows),
+                ("result_bytes", budget.max_result_bytes),
+            ):
+                if limit is None:
+                    continue
+                remainder = limit - used[key]
+                if result[key] is None or remainder < result[key]:
+                    result[key] = remainder
+        return result
+
+    def events(self, database):
+        """Bounded event log: (kind, path, sql_count, rows, result_bytes)."""
+        account = self._introspect_account()
+        if account is None:
+            return ()
+        counters = account.counters(database)
+        if counters is None:
+            return ()
+        return tuple(counters.events)
+
+
 class Local(localbase):
     def __init__(self):
         self.debug = False
@@ -538,6 +1002,8 @@ class Local(localbase):
         self.db_context_counter = 0
         self.db_session = None
         self.prefetch_context_stack = []
+        self.read_budget_stack = []
+        self.read_path_stack = []
         self.current_user = None
         self.perms_context = None
         self.user_groups_cache = {}
@@ -1295,7 +1761,15 @@ class Database:
             start_transaction=True,
         )
 
-    def _exec_raw_sql(self, sql, globals, locals, frame_depth, start_transaction=False):
+    def _exec_raw_sql(
+        self,
+        sql,
+        globals,
+        locals,
+        frame_depth,
+        start_transaction=False,
+        explicit_read=False,
+    ):
         provider = self.provider
         if provider is None:
             throw(MappingError, "Database object is not bound with a provider yet")
@@ -1307,14 +1781,44 @@ class Database:
             locals = sys._getframe(frame_depth).f_locals
         adapted_sql, code = adapt_sql(sql, provider.paramstyle)
         arguments = eval(code, globals, locals)
-        return self._exec_sql(adapted_sql, arguments, False, start_transaction)
+        if explicit_read:
+            read = True
+            path = ("raw-select", truncate_repr(adapted_sql))
+        elif local.read_budget_stack:
+            # Never infer side effects from a textual SQL prefix: a generic
+            # raw statement cannot be proven read-only. Strict budgets reject
+            # it, permissive budgets let it bypass accounting untouched.
+            budget = local.read_budget_stack[-1].budget
+            if budget.strict:
+                throw(
+                    UnsafeRawStatementError,
+                    adapted_sql,
+                    _build_read_path(("raw-unclassified",)),
+                )
+            read = False
+            path = None
+        else:
+            read = False
+            path = None
+        return self._exec_sql(
+            adapted_sql,
+            arguments,
+            False,
+            start_transaction,
+            read=read,
+            path=path,
+        )
 
     @cut_traceback
     def select(self, sql, globals=None, locals=None, frame_depth=0):
         if not select_re.match(sql):
             sql = "select " + sql
         cursor = self._exec_raw_sql(
-            sql, globals, locals, frame_depth + cut_traceback_depth + 1
+            sql,
+            globals,
+            locals,
+            frame_depth + cut_traceback_depth + 1,
+            explicit_read=True,
         )
         max_fetch_count = options.MAX_FETCH_COUNT
         if max_fetch_count is not None:
@@ -1350,7 +1854,11 @@ class Database:
         if not select_re.match(sql):
             sql = "select " + sql
         cursor = self._exec_raw_sql(
-            sql, globals, locals, frame_depth=cut_traceback_depth + 1
+            sql,
+            globals,
+            locals,
+            frame_depth=cut_traceback_depth + 1,
+            explicit_read=True,
         )
         result = cursor.fetchone()
         return bool(result)
@@ -1392,12 +1900,27 @@ class Database:
         return sql, adapter
 
     def _exec_sql(
-        self, sql, arguments=None, returning_id=False, start_transaction=False
+        self,
+        sql,
+        arguments=None,
+        returning_id=False,
+        start_transaction=False,
+        read=False,
+        path=None,
     ):
         cache = self._get_cache()
+        budgeted_read = read and bool(local.read_budget_stack)
+        if budgeted_read:
+            full_path = _build_read_path(path)
+            _check_dirty_session_read(cache, full_path)
+        else:
+            full_path = None
         if start_transaction:
             cache.immediate = True
         connection = cache.prepare_connection_for_query_execution()
+        if budgeted_read:
+            # Reserve the statement before it reaches the DBAPI driver.
+            _reserve_read_sql(self, full_path)
         cursor = connection.cursor()
         if local.debug:
             log_sql(sql, arguments)
@@ -1415,6 +1938,8 @@ class Database:
         if cache.immediate:
             cache.in_transaction = True
         self._update_local_stat(sql, t)
+        if budgeted_read and not returning_id:
+            cursor = _BudgetCursor(cursor, self, full_path)
         if not returning_id:
             return cursor
         return new_id
@@ -3346,7 +3871,12 @@ class Attribute:
             else:
                 sql, adapter, offsets = self.lazy_sql_cache
             arguments = adapter(obj._get_raw_pkval_())
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("lazy-attr", entity.__name__, self.name),
+            )
             row = cursor.fetchone()
             dbval = self.parse_value(row, offsets, cache.dbvals_deduplication_cache)
             self.db_set(obj, dbval)
@@ -4246,7 +4776,12 @@ class Set(Collection):
                     len(batch), reverse
                 )
                 arguments = adapter(batch)
-                cursor = database._exec_sql(sql, arguments)
+                cursor = database._exec_sql(
+                    sql,
+                    arguments,
+                    read=True,
+                    path=("prefetch", entity.__name__, self.name),
+                )
                 result.update(rentity._fetch_objects(cursor, attr_offsets))
         else:
             pk_len = len(entity._pk_columns_)
@@ -4255,7 +4790,12 @@ class Set(Collection):
                 batch = objects[i : i + max_batch_size]
                 sql, adapter = self.construct_sql_m2m(len(batch))
                 arguments = adapter(batch)
-                cursor = database._exec_sql(sql, arguments)
+                cursor = database._exec_sql(
+                    sql,
+                    arguments,
+                    read=True,
+                    path=("prefetch", entity.__name__, self.name),
+                )
                 if len(batch) > 1:
                     for row in cursor.fetchall():
                         obj = entity._get_by_raw_pkval_(row[:pk_len])
@@ -4337,14 +4877,24 @@ class Set(Collection):
                     len(items)
                 )
                 arguments = adapter(items)
-                cursor = database._exec_sql(sql, arguments)
+                cursor = database._exec_sql(
+                    sql,
+                    arguments,
+                    read=True,
+                    path=("lazy-collection", entity.__name__, self.name),
+                )
                 items = rentity._fetch_objects(cursor, attr_offsets)
                 return setdata
 
             sql, adapter = self.construct_sql_m2m(1, len(items))
             items.append(obj)
             arguments = adapter(items)
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("lazy-collection", entity.__name__, self.name),
+            )
             loaded_items = {
                 rentity._get_by_raw_pkval_(row) for row in cursor.fetchall()
             }
@@ -4387,12 +4937,22 @@ class Set(Collection):
                 len(objects), reverse
             )
             arguments = adapter(objects)
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("lazy-collection", entity.__name__, self.name),
+            )
             items = rentity._fetch_objects(cursor, attr_offsets)
         else:
             sql, adapter = self.construct_sql_m2m(len(objects))
             arguments = adapter(objects)
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("lazy-collection", entity.__name__, self.name),
+            )
             pk_len = len(entity._pk_columns_)
             d = {}
             if len(objects) > 1:
@@ -4953,7 +5513,12 @@ class SetInstance:
         else:
             sql, adapter, attr_offsets = cached_sql
         arguments = adapter(obj._get_raw_pkval_())
-        cursor = database._exec_sql(sql, arguments)
+        cursor = database._exec_sql(
+            sql,
+            arguments,
+            read=True,
+            path=("lazy-collection", entity.__name__, attr.name, "is_empty"),
+        )
         if reverse.is_collection:
             row = cursor.fetchone()
             if row is not None:
@@ -5030,7 +5595,12 @@ class SetInstance:
             sql, adapter = cached_sql
         arguments = adapter(obj._get_raw_pkval_())
         with cache.flush_disabled():
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("lazy-collection", attr.entity.__name__, attr.name, "count"),
+            )
         setdata.count = cursor.fetchone()[0]
         if setdata.added:
             setdata.count += len(setdata.added)
@@ -5965,6 +6535,13 @@ class EntityMeta(type):
         database = cls._database_
         cache = database._get_cache()
         if cache.modified:
+            if local.read_budget_stack:
+                _check_dirty_session_read(
+                    cache,
+                    _build_read_path(
+                        ("query", cls.__name__, "select_random")
+                    ),
+                )
             cache.flush()
         max_id = cache.max_id_cache.get(pk)
         if max_id is None:
@@ -5977,7 +6554,11 @@ class EntityMeta(type):
                 ]
                 max_id_sql, adapter = database._ast2sql(sql_ast)
                 cls._cached_max_id_sql_ = max_id_sql
-            cursor = database._exec_sql(max_id_sql)
+            cursor = database._exec_sql(
+                max_id_sql,
+                read=True,
+                path=("query", cls.__name__, "select_random", "max_id"),
+            )
             max_id = cursor.fetchone()[0]
             cache.max_id_cache[pk] = max_id
         if max_id is None:
@@ -6016,7 +6597,12 @@ class EntityMeta(type):
                 len(ids), from_seeds=False
             )
             arguments = adapter([(id,) for id in ids])
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("query", cls.__name__, "select_random"),
+            )
             objects = cls._fetch_objects(cursor, attr_offsets)
             result.extend(objects)
             tried_ids.update(ids)
@@ -6141,7 +6727,12 @@ class EntityMeta(type):
         arguments = adapter(avdict)
         if for_update:
             database._get_cache().immediate = True
-        cursor = database._exec_sql(sql, arguments)
+        cursor = database._exec_sql(
+            sql,
+            arguments,
+            read=True,
+            path=("find", cls.__name__),
+        )
         objects = cls._fetch_objects(cursor, attr_offsets, 1, for_update, avdict)
         return objects[0] if objects else None
 
@@ -6149,7 +6740,9 @@ class EntityMeta(type):
         if not isinstance(sql, str):
             throw(TypeError)
         database = cls._database_
-        cursor = database._exec_raw_sql(sql, globals, locals, frame_depth + 1)
+        cursor = database._exec_raw_sql(
+            sql, globals, locals, frame_depth + 1, explicit_read=True
+        )
 
         col_names = [column_info[0].upper() for column_info in cursor.description]
         attr_offsets = {}
@@ -6452,7 +7045,12 @@ class EntityMeta(type):
             objects = objects[max_batch_size:]
             sql, adapter, attr_offsets = cls._construct_batchload_sql_(len(batch))
             arguments = adapter(batch)
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("batch-load", cls.__name__),
+            )
             result = cls._fetch_objects(cursor, attr_offsets)
             if len(result) < len(batch):
                 for obj in result:
@@ -7100,7 +7698,12 @@ class Entity(metaclass=EntityMeta):
             batch = objects[i : i + max_batch_size]
             sql, adapter, attr_offsets = cls._construct_batchload_sql_(len(batch))
             arguments = adapter(batch)
-            cursor = database._exec_sql(sql, arguments)
+            cursor = database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("prefetch", cls.__name__),
+            )
             cls._fetch_objects(cursor, attr_offsets)
 
     def _load_(self):
@@ -7124,7 +7727,12 @@ class Entity(metaclass=EntityMeta):
                 objects.append(seed)
         sql, adapter, attr_offsets = entity._construct_batchload_sql_(len(objects))
         arguments = adapter(objects)
-        cursor = database._exec_sql(sql, arguments)
+        cursor = database._exec_sql(
+            sql,
+            arguments,
+            read=True,
+            path=("load", entity.__name__),
+        )
         objects = entity._fetch_objects(cursor, attr_offsets)
         if self not in objects:
             throw(
@@ -7218,7 +7826,12 @@ class Entity(metaclass=EntityMeta):
             sql, adapter, attr_offsets = cached_sql
         arguments = adapter(self._get_raw_pkval_())
 
-        cursor = database._exec_sql(sql, arguments)
+        cursor = database._exec_sql(
+            sql,
+            arguments,
+            read=True,
+            path=("object-load", entity.__name__),
+        )
         objects = entity._fetch_objects(cursor, attr_offsets)
         if self not in objects:
             throw(
@@ -8528,7 +9141,7 @@ class Query:
 
     def _actual_fetch(self, limit=None, offset=None):
         translator = self._translator
-        with self._prefetch_context:
+        with self._prefetch_context, read_path("query"):
             sql, arguments, attr_offsets, query_key = self._construct_sql_and_arguments(
                 limit, offset
             )
@@ -8536,10 +9149,18 @@ class Query:
             cache = database._get_cache()
             if self._for_update:
                 cache.immediate = True
+            if local.read_budget_stack:
+                # Reject before the normal pre-query autoflush can run; the
+                # budget itself never initiates a flush.
+                _check_dirty_session_read(
+                    cache, _build_read_path(("query-fetch",))
+                )
             cache.prepare_connection_for_query_execution()  # may clear cache.query_results
             items = cache.query_results.get(query_key)
             if items is None:
-                cursor = database._exec_sql(sql, arguments)
+                cursor = database._exec_sql(
+                    sql, arguments, read=True, path=("query-fetch",)
+                )
                 if isinstance(translator.expr_type, EntityMeta):
                     entity = translator.expr_type
                     items = entity._fetch_objects(
@@ -9121,7 +9742,12 @@ class Query:
         try:
             result = cache.query_results[query_key]
         except KeyError:
-            cursor = self._database._exec_sql(sql, arguments)
+            cursor = self._database._exec_sql(
+                sql,
+                arguments,
+                read=True,
+                path=("aggregate", aggr_func_name or "scalar"),
+            )
             row = cursor.fetchone()
             if row is not None:
                 result = row[0]
